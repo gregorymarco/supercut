@@ -360,8 +360,14 @@ export async function record(opts: RecordOptions): Promise<RecordResult> {
   }
 
   // launch is the only setup outside try/finally; everything else (newPage,
-  // CDP session) lives inside so a setup failure can't leak the browser
-  const browser = await chromium.launch({ headless: true, args: launchArgs });
+  // CDP session) lives inside so a setup failure can't leak the browser.
+  // SUPERCUT_CDP_URL films a window the user already signed into. That
+  // connection must not be closed: browser.close() kills their window.
+  const cdpUrl = process.env.SUPERCUT_CDP_URL;
+  const attachedOverCdp = Boolean(cdpUrl);
+  const browser = cdpUrl
+    ? await chromium.connectOverCDP(cdpUrl)
+    : await chromium.launch({ headless: true, args: launchArgs });
 
   const events: KnownEvent[] = [];
   const pathPoints: [number, number, number][] = []; // [t, x, y] global cursor track
@@ -374,6 +380,11 @@ export async function record(opts: RecordOptions): Promise<RecordResult> {
   // mid-reload, and capturing those frames makes the video FLASH at every scene
   // change. Skip them — the renderer holds the last good frame across the gap.
   let isNavigating = false;
+  /** a wait-for-selector is holding for a slow result. Frames in this window
+   *  are dropped and the elapsed wall time is removed from the timeline, so
+   *  the video cuts from the action to the result. */
+  let cutting = false;
+  let elidedMs = 0;
   let writeErrors = 0;
   let lastWrite: Promise<void> = Promise.resolve();
   let signalFirstFrame: () => void = () => {};
@@ -438,7 +449,7 @@ export async function record(opts: RecordOptions): Promise<RecordResult> {
     return false;
   }
 
-  const observedNow = () => Date.now() - wallStart;
+  const observedNow = () => Date.now() - wallStart - elidedMs;
   /** monotonic stamp: event `t` rides the observed clock; sleep/rounding jitter
    *  of a few ms must never produce an out-of-order timeline */
   let lastStampT = 0;
@@ -638,7 +649,22 @@ export async function record(opts: RecordOptions): Promise<RecordResult> {
         break;
       }
       case "wait":
-        await sleep(a.duration_ms);
+        if (a.selector) {
+          // Wall-clock poll, not video time. Cloud agents sit on "working"
+          // for minutes; that stretch is cut out of the take.
+          const cutStart = Date.now();
+          cutting = true;
+          console.error(`cut: waiting for ${a.selector}`);
+          try {
+            await page.locator(a.selector).first().waitFor({ state: "visible", timeout: 8 * 60 * 1000 });
+            console.error(`cut: visible after ${((Date.now() - cutStart) / 1000).toFixed(1)}s`);
+          } finally {
+            elidedMs += Date.now() - cutStart;
+            cutting = false;
+          }
+        } else {
+          await sleep(a.duration_ms);
+        }
         break;
       case "click":
       case "hover":
@@ -772,11 +798,23 @@ export async function record(opts: RecordOptions): Promise<RecordResult> {
     // guard ON: service workers are blocked — a registered worker's fetches
     // are not routed through the context, which would hand the page an
     // ungated network channel
-    page = await browser.newPage({
-      viewport: VIEWPORT,
-      deviceScaleFactor: DPR,
-      ...(allowPrivateNetwork ? {} : { serviceWorkers: "block" as const }),
-    });
+    if (attachedOverCdp) {
+      const context = browser.contexts()[0];
+      if (!context) throw new Error("CDP browser has no context to film");
+      const open = context.pages().filter((p) => p.url().startsWith("http"));
+      const existing = open[0] ?? context.pages()[0];
+      if (!existing) throw new Error("CDP browser has no tab to film — open one first");
+      page = existing;
+      // The filmed display is 1728x1080. 1920x1080 does not fit, so the
+      // window the user is watching would clip.
+      await page.setViewportSize({ width: 1440, height: 810 });
+    } else {
+      page = await browser.newPage({
+        viewport: VIEWPORT,
+        deviceScaleFactor: DPR,
+        ...(allowPrivateNetwork ? {} : { serviceWorkers: "block" as const }),
+      });
+    }
     // guard ON: gate EVERY in-flight request (clicked links, Enter submits,
     // subresources) and every redirect hop of each — assertSafeNavigationUrl
     // only covers entry/goto URLs known from the recipe, but a click on an
@@ -867,8 +905,13 @@ export async function record(opts: RecordOptions): Promise<RecordResult> {
           // clamp: delivery jitter can hand us a frame stamped a hair BEFORE
           // the first-processed frame; a negative t_source would sort to
           // entry 0 and fail render-plan validation
-          frameIndex.push({ file, t_source: Math.max(0, stampMs - firstFrameStamp) });
-          if (wallStart > 0) navLog.frame(stampMs - wallStart, hash);
+          const tSource = Math.max(0, stampMs - firstFrameStamp - elidedMs);
+          const prevT = frameIndex[frameIndex.length - 1]?.t_source ?? -1;
+          // a frame captured during a cut can be acked after elidedMs jumps;
+          // indexing it would rewind the timeline
+          if (tSource + 50 < prevT) return;
+          frameIndex.push({ file, t_source: tSource });
+          if (wallStart > 0) navLog.frame(stampMs - wallStart - elidedMs, hash);
         } catch {
           writeErrors++;
         } finally {
@@ -881,7 +924,7 @@ export async function record(opts: RecordOptions): Promise<RecordResult> {
         // earlier in-flight write and drop its frame from the index. The
         // isNavigating flag is sampled at event time (its capture semantics),
         // and per-frame failures never poison the chain (writeErrors counts).
-        const dropping = isNavigating;
+        const dropping = isNavigating || cutting;
         lastWrite = lastWrite.then(() => handleFrame(ev, dropping)).catch(() => {});
       });
     }
@@ -1002,7 +1045,7 @@ export async function record(opts: RecordOptions): Promise<RecordResult> {
       await cdp.send("Page.stopScreencast").catch(() => {});
     }
     await lastWrite.catch(() => {});
-    await browser.close();
+    if (!attachedOverCdp) await browser.close();
   }
 
   if (writeErrors > 0) {

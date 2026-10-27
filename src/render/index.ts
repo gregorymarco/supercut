@@ -549,7 +549,12 @@ export async function renderTake(opts: RenderOptions): Promise<RenderResult> {
   const port = (server.address() as { port: number }).port;
 
   // Full Chromium: the stripped headless shell has no WebCodecs.
-  const launch = opts.launchBrowser ?? (() => chromium.launch({ headless: true, channel: "chromium" }));
+  const chromePath = process.env.SUPERCUT_CHROME;
+  const launch = opts.launchBrowser ?? (() => chromium.launch({
+    headless: true,
+    ...(chromePath ? { executablePath: chromePath } : { channel: "chromium" }),
+    args: ["--disable-dev-shm-usage"],
+  }));
   let browser: Browser | undefined;
   // The CLI exits via process.exitCode (never process.exit(), which can
   // truncate piped stdout), so anything still holding the event loop after

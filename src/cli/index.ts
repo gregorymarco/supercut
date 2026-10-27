@@ -169,6 +169,11 @@ async function main(): Promise<number> {
       // must not treat this run as a success
       const outcome = recordOutcome(res);
       for (const line of outcome.lines) console.error(line);
+      if (process.env.SUPERCUT_CDP_URL) {
+        // The DevTools socket keeps Node alive, and closing it via
+        // browser.close() kills the window the user is signed into.
+        process.exit(outcome.code);
+      }
       return outcome.code;
     }
     case "render": {
